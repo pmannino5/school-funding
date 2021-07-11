@@ -1,0 +1,240 @@
+---
+title: "School District Spending"
+output: 
+  html_notebook: 
+    fig_width: 8
+---
+This notebook documents racial/ethnic disparities in school funding. It uses the Urban Institutes R package to extract school finance and enrollment data and makes adjustments for charter schools (along with a couple other small adjustments) and applies a cost of living adjustment based on the county the district is located in.
+
+A lot of spending disparity research focuses only on state and local funding sources because of the federal programs "supplement not supplant" provisions, but this note is just interested in total disparities, so I include local, state, and federal funding sources.
+
+## Extract Data
+
+```{r}
+# get district cost of living index from edbuild
+district_cola <- masterpull('2016',data_type = 'fin') %>%
+  mutate(LR_cola = LRPP_cola*ENROLL,
+         SR_cola = SRPP_cola*ENROLL,
+         SLR_cola = SLRPP_cola*ENROLL,
+         cola_sr = SR_cola/SR,
+         cola_lr = LR_cola/LR) %>%
+  select(NCESID, cola_sr)
+
+# school district revenue and expenditures
+finance <- get_education_data(level = 'school-districts',
+                              source = 'ccd',
+                              topic = 'finance',
+                              filters = list(year = 2016))
+
+# district enrollment by race
+enrollment <- get_education_data(level = 'school-districts',
+                                 source = 'ccd',
+                                 topic = 'enrollment',
+                                 subtopic = list('race'),
+                                 filters = list(year = 2016),
+                                 add_labels = TRUE)
+
+# district characteristics
+directory <- get_education_data(level = 'school-districts',
+                                source = 'ccd',
+                                topic = 'directory',
+                                filters = list(year = 2016))
+
+
+```
+
+
+## Manipulate and link data
+
+```{r}
+# adjust revenues based on edbuild methodology - leave arkansas and texas alone
+fin_adjusted <- finance %>%
+  mutate(adjrev_state_total = rev_state_total - rev_state_outlay_capital_debt, # remove state capital rev
+         adjrev_local_total = rev_local_total - rev_local_property_sale, # remove local property sales
+         pct_local = rev_local_total/rev_total,
+         pct_state = rev_state_total/rev_total,
+         pct_fed = rev_fed_total/rev_total,
+         adjrev_local_total = adjrev_local_total - (payments_charter_schools*pct_local), # remove payments to charters
+         adjrev_state_total = adjrev_state_total - (payments_charter_schools*pct_state), # remove payments to charters
+         adjrev_fed_total = rev_fed_total - (payments_charter_schools*pct_state), # remove payments to charters
+         adjrev_total = adjrev_fed_total+adjrev_state_total+adjrev_local_total, # calculate total rev adjusted
+         adjrev_sl = adjrev_local_total+adjrev_state_total) # calc total state and local rev adjusted
+
+# reshape race table
+enroll_race <- enrollment %>%
+  filter(sex == 'Total',
+         grade == 'Total') %>%
+  group_by(leaid, fips, race) %>%
+  summarize(enrollment = sum(enrollment)) %>%
+  tidyr:: spread(key = race, value = enrollment)
+
+# link enrollment to finance and cola index
+enroll_race_finance <- enroll_race %>%
+  left_join(fin_adjusted[c('leaid','rev_total','rev_fed_total','rev_state_total','rev_local_total',
+                           'adjrev_total', 'adjrev_state_total','adjrev_local_total','adjrev_fed_total','adjrev_sl')]) %>%
+  inner_join(district_cola, by = c('leaid' = 'NCESID')) %>%
+  filter(Total > 0, rev_total >= 0) %>%
+  mutate(adjrev_total_cola = adjrev_total*cola_sr, # adj total rev cola
+         adjrev_sl_cola = adjrev_sl*cola_sr, # adj state and local rev cola
+         adjrev_fed_total_cola = adjrev_fed_total*cola_sr, # adj federal rev cola
+         adjrev_state_total_cola = adjrev_state_total*cola_sr, # adj state rev cola
+         adjrev_local_total_cola = adjrev_local_total*cola_sr, # adj local rev cola
+         adjrev_per_pupil_cola = adjrev_total_cola / Total, # adj total rev per pupil
+         adjrev_sl_per_pupil_cola = adjrev_sl_cola/ Total, # adj state and local rev per pupil
+         pct_black = Black / Total * 100,
+         pct_hisp = Hispanic / Total * 100,
+         pct_white = White / Total * 100,
+         pct_nonwhite = 100 - pct_white,
+         nonwhite = Total - White,
+         w_nw_schools = case_when(pct_nonwhite >= 75 ~ 'nonwhite',
+                                  pct_nonwhite <= 25 ~ 'white',
+                                  TRUE ~ 'NotConcentrated'),
+         w_b_schools = case_when(pct_black >= 75 ~ 'black',
+                                 pct_white >= 75 ~ 'white',
+                                 TRUE ~ 'NotConcentrated')) %>%
+  tidyr::drop_na() %>% ungroup()
+
+# bucket race pcts black and nonwhite
+enroll_race_finance$pct_black_bin <- cut(enroll_race_finance$pct_black, breaks = 10, labels = c(10,20,30,40,50,60,70,80,90,100))
+enroll_race_finance$pct_nonwhite_bin <- cut(enroll_race_finance$pct_nonwhite, breaks = 10, labels = c(10,20,30,40,50,60,70,80,90,100))
+
+```
+
+
+## Graph of Revenue per Pupil by District Racial Composition
+
+```{r, fig.width=10, fig.height=4}
+
+# federal, state and local adj rev cola, black bin scatterplot
+p1 <- enroll_race_finance %>% filter(pct_black <= 100) %>%
+  group_by(pct_black_bin) %>% 
+  summarize(adjrev_per_pupil_cola = sum(adjrev_total_cola) / sum(Total)) %>%
+  ggplot(mapping = aes(x = pct_black_bin, y = adjrev_per_pupil_cola)) + 
+  geom_point() + labs(title = 'Revenue per Pupil', subtitle =  'Binned Black Percent') + 
+  theme(title = element_text(size = 10))
+
+# federal, state and local adj rev cola, nonwhite bin scatterplot
+p2 <- enroll_race_finance %>% filter(pct_nonwhite <= 100) %>%
+  group_by(pct_nonwhite_bin) %>% 
+  summarize(adjrev_per_pupil_cola = sum(adjrev_total_cola) / sum(Total)) %>%
+  ggplot(mapping = aes(x = pct_nonwhite_bin, y = adjrev_per_pupil_cola)) + 
+  geom_point() + labs(title = 'Revenue per Pupil', subtitle =  'Binned Nonwhite Percent') + 
+  theme(title = element_text(size = 10))
+
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+
+Revenue per Pupil is higher in districts with a higher share of black students, but is lower in districts with a higher share of nonwhite students.
+
+## Average Revenue per Pupil in Segregated Schools
+
+```{r}
+
+# rev per student for majority black schools vs majority white schools (>75%)
+enroll_race_finance %>%
+  group_by(w_b_schools) %>%
+  summarize(rev_per_pupil_cola = sum(adjrev_total_cola) / sum(Total),
+            numstudents = sum(Total)) %>%
+  filter(w_b_schools != 'NotConcentrated')
+
+# rev per student for majority nonwhite schools vs majority white schools (>75%)
+enroll_race_finance %>%
+  group_by(w_nw_schools) %>%
+  summarize(rev_per_pupil_cola = sum(adjrev_total_cola) / sum(Total),
+            numstudents = sum(Total)) %>% filter(w_nw_schools != 'NotConcentrated')
+
+```
+
+Revenue per pupil in majority black districts is fairly close to revenue per pupil in majority white districts. Though there are very few black students educated in districts where 75% of kids are black.
+
+Revenue per pupil is substantially lower in districts that are majority (>75%) non-white (black, hispanic, asian) than in districts that are majority (>75%) white. 
+
+## National Average Revenue per Pupil By Race
+
+```{r}
+enroll_race_finance %>%
+  mutate(adjrev_black_students = adjrev_per_pupil_cola*Black,
+         adjrev_white_students = adjrev_per_pupil_cola*White,
+         national = 'national') %>%
+  group_by(national) %>%
+  summarize(avg_rev_black_students  = sum(adjrev_black_students)/sum(Black),
+            avg_rev_white_students  = sum(adjrev_white_students)/sum(White)) %>%
+  mutate(percent_diff = (avg_rev_black_students-avg_rev_white_students) / avg_rev_black_students)
+
+enroll_race_finance %>%
+  mutate(adjrev_nonwhite_students = adjrev_per_pupil_cola*nonwhite,
+         adjrev_white_students = adjrev_per_pupil_cola*White,
+         national = 'national') %>%
+  group_by(national) %>%
+  summarize(avg_rev_nonwhite_students  = sum(adjrev_nonwhite_students)/sum(nonwhite),
+            avg_rev_white_students  = sum(adjrev_white_students)/sum(White)) %>%
+  mutate(percent_diff = (avg_rev_nonwhite_students - avg_rev_white_students) / avg_rev_white_students)
+
+```
+
+The average black student in the US attends a district where revenue is 2.5% lower than districts attended by the average white student. The average nonwhite student in the US attends a district where revenue is about 6.1% lower than for the average white student.
+
+## State Average Revenue per Pupil Difference By Race
+
+```{r, fig.width=10, fig.height=4}
+
+p3 <- enroll_race_finance %>%
+  mutate(adjrev_black_students = adjrev_per_pupil_cola*Black,
+         adjrev_white_students = adjrev_per_pupil_cola*White,
+         national = 'national') %>%
+  group_by(fips) %>%
+  summarize(natl_rev_black_students  = sum(adjrev_black_students)/sum(Black),
+            natl_rev_white_students  = sum(adjrev_white_students)/sum(White)) %>%
+  mutate(pct_black_white_difference = (natl_rev_black_students - natl_rev_white_students)/natl_rev_white_students*100) %>%
+  
+  ggplot(mapping = aes(x = fips, y = pct_black_white_difference)) + geom_col() +
+  theme(axis.text.x = element_text(angle = 90,hjust = 1, vjust = .5))
+
+# rev difference for average nonwhite and white student in each state
+p4 <- enroll_race_finance %>%
+  mutate(adjrev_nonwhite_students = adjrev_per_pupil_cola*nonwhite,
+         adjrev_white_students = adjrev_per_pupil_cola*White,
+         national = 'national') %>%
+  group_by(fips) %>%
+  summarize(natl_rev_nonwhite_students  = sum(adjrev_nonwhite_students)/sum(nonwhite),
+            natl_rev_white_students  = sum(adjrev_white_students)/sum(White),
+            white = sum(White),
+            nonwhite = sum(nonwhite)) %>%
+  mutate(pct_nonwhite_white_difference = (natl_rev_nonwhite_students - natl_rev_white_students)/natl_rev_white_students*100) %>%
+  
+  ggplot(mapping = aes(x = fips, y = pct_nonwhite_white_difference)) + geom_col() +
+  theme(axis.text.x = element_text(angle = 90,hjust = 1, vjust = .5))
+
+gridExtra::grid.arrange(p3,p4,nrow=1)
+```
+
+
+
+
+## Revenue by Source for Segregated Schools
+
+```{r}
+
+# revenue by source in white and black (>75%) schools
+enroll_race_finance %>%
+  group_by(w_b_schools) %>%
+  summarize(FederalRev = sum(adjrev_fed_total_cola)/sum(Total),
+            StateRev = sum(adjrev_state_total_cola)/sum(Total),
+            LocalRev = sum(adjrev_local_total_cola)/sum(Total)) %>%
+  filter(w_b_schools != 'NotConcentrated')
+
+# revenue by source in white and nonwhite (>75%) schools
+enroll_race_finance %>%
+  group_by(w_nw_schools) %>%
+  summarize(FederalRev = sum(adjrev_fed_total_cola)/sum(Total),
+            StateRev = sum(adjrev_state_total_cola)/sum(Total),
+            LocalRev = sum(adjrev_local_total_cola)/sum(Total)) %>%
+  filter(w_nw_schools != 'NotConcentrated')
+
+
+```
+
+No surprises here. State revenue is fairly equal, local revenue favors white students, and federal revenue favors nonwhite students.
+
+
